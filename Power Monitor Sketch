@@ -1,0 +1,173 @@
+#include <Adafruit_INA228.h>
+#include <Adafruit_INA2xx.h>
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Wire.h>
+#include <Adafruit_INA228.h>
+
+// --- Wi-Fi Credentials ---
+const char* ssid = "ENTER your SSID";
+const char* password = "Enter your password";
+
+Adafruit_INA228 ina228 = Adafruit_INA228();
+WebServer server(80);
+
+float maxCurrent_mA = 0.0;
+
+// --- Embedded Web Dashboard ---
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bench PSU Monitor</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #121212; color: #eee; margin: 0; padding: 20px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
+    .card { background: #1e1e1e; padding: 15px; border-radius: 10px; border: 1px solid #333; text-align: center; }
+    .label { font-size: 0.85rem; color: #aaa; text-transform: uppercase; }
+    .val { font-size: 1.8rem; font-weight: bold; margin-top: 5px; color: #4caf50; }
+    #vVal { color: #2196f3; }
+    #wVal { color: #ff9800; }
+    #mVal { color: #f44336; }
+    canvas { width: 100%; height: 280px; background: #1e1e1e; border-radius: 10px; border: 1px solid #333; display: block; }
+    button { margin-top: 15px; padding: 10px 18px; font-size: 1rem; border: none; border-radius: 6px; background: #333; color: #fff; cursor: pointer; }
+    button:hover { background: #444; }
+  </style>
+</head>
+<body>
+  <h2>Bench DC Power Monitor</h2>
+  <div class="grid">
+    <div class="card"><div class="label">Voltage</div><div class="val" id="vVal">0.00 V</div></div>
+    <div class="card"><div class="label">Current</div><div class="val" id="cVal">0.0 A</div></div>
+    <div class="card"><div class="label">Power</div><div class="val" id="wVal">0.00 W</div></div>
+    <div class="card"><div class="label">Max Current</div><div class="val" id="mVal">0.0 A</div></div>
+  </div>
+  <canvas id="chart"></canvas>
+  <button onclick="fetch('/reset')">Reset Max Current</button>
+
+  <script>
+    const canvas = document.getElementById('chart');
+    const ctx = canvas.getContext('2d');
+    const maxPoints = 120; // 30 seconds at 250ms interval
+    let history = new Array(maxPoints).fill(0);
+
+    function resize() {
+      canvas.width = canvas.clientWidth;
+      canvas.height = canvas.clientHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    function drawChart() {
+      const w = canvas.width, h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      const peak = Math.max(...history, 10);
+      const scaleMax = peak * 1.15;
+
+      ctx.strokeStyle = '#2c2c2c';
+      ctx.fillStyle = '#888';
+      ctx.font = '12px sans-serif';
+      for (let i = 0; i <= 4; i++) {
+        let y = h - (h * (i / 4));
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+        ctx.fillText(((scaleMax * i) / 4).toFixed(1) + ' mA', 8, y - 4);
+      }
+
+      ctx.strokeStyle = '#4caf50';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      history.forEach((val, idx) => {
+        let x = (idx / (maxPoints - 1)) * w;
+        let y = h - ((val / scaleMax) * h);
+        if (idx === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    async function updateData() {
+      try {
+        const res = await fetch('/data');
+        const d = await res.json();
+        document.getElementById('vVal').innerText = d.v.toFixed(3) + ' V';
+        document.getElementById('cVal').innerText = d.c.toFixed(2) + ' mA';
+        document.getElementById('wVal').innerText = d.w.toFixed(3) + ' W';
+        document.getElementById('mVal').innerText = d.m.toFixed(2) + ' mA';
+
+        history.push(d.c);
+        if (history.length > maxPoints) history.shift();
+        drawChart();
+      } catch (e) {}
+    }
+    setInterval(updateData, 250);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send(200, "text/html", index_html);
+}
+
+void handleData() {
+  float busV = ina228.getBusVoltage_V() / 10;     // Returns Volts (V) directly
+  float current_mA = ina228.getCurrent_mA(); // Returns Milliamps (mA) directly
+  float power_W = ina228.getPower_mW() / 1000.0; // Convert mW to Watts (W)
+
+  if (current_mA > maxCurrent_mA) {
+    maxCurrent_mA = current_mA;
+  }
+
+  String json = "{\"v\":" + String(busV, 4) + 
+                ",\"c\":" + String(current_mA, 3) + 
+                ",\"w\":" + String(power_W, 4) + 
+                ",\"m\":" + String(maxCurrent_mA, 3) + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleReset() {
+  maxCurrent_mA = 0.0;
+  server.send(200, "text/plain", "OK");
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize STEMMA QT I2C port (Wire1 on QT Py ESP32-S3)
+  Wire1.begin(SDA1, SCL1);
+
+  if (!ina228.begin(0x40, &Wire1)) {
+    Serial.println("Failed to find INA228 on STEMMA QT port!");
+    while (1) delay(10);
+  }
+
+  // Configure for Adafruit's onboard 15 mOhm shunt (0.015 ohm) and 10A max
+  ina228.setShunt(0.015, 10.0);
+  ina228.setAveragingCount(INA228_COUNT_16);
+  ina228.setVoltageConversionTime(INA228_TIME_150_us);
+  ina228.setCurrentConversionTime(INA228_TIME_150_us);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected! IP Address: " + WiFi.localIP().toString());
+
+  if (MDNS.begin("psu")) {
+    Serial.println("mDNS active: open http://psu.local in your browser");
+  }
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/reset", handleReset);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
